@@ -1,0 +1,434 @@
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+
+
+# =========================================
+# 設定
+# =========================================
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("device:", device)
+
+
+# =========================================
+# 方策ネット（普通の全結合NN, 符号付き出力）
+# =========================================
+
+class PolicyNet(nn.Module):
+    """
+    state = (S_t, V_t, Q_t, q_t) -> u_t in (-1, 1)
+    実際のトレード速度は v_t = v_max * u_t で決める。
+    """
+    def __init__(self, state_dim: int = 4, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Tanh(),  # 符号付き: u ∈ (-1,1)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)  # (batch, 1)
+
+
+# =========================================
+# シミュレーション（決定論的ボリューム + 符号付き v_t）
+# =========================================
+
+def simulate_batch_signed_volume(
+    policy: nn.Module,
+    batch_size: int = 256,
+    J: int = 200,
+    T: float = 1.0,
+    S0: float = 50.0,
+    q0: float = 400000.0,
+    V_const: float = 4_000_000.0,
+    sigma: float = 0.45,
+    eta: float = 0.12,
+    phi: float = 0.63,
+    k: float = 5e-7,
+    gamma: float = 3e-6,
+    v_max: float | None = None,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """
+    決定論的ボリューム V_t ≡ V_const のもとで
+      dS = sigma dW - k v dt
+      dQ = V_const dt
+      dX = (v S - V_const L(v/V_const)) dt
+    を N=batch_size 本シミュレートし、
+    L(θ) = E[exp(-γ PnL)] を最小化するための loss を返す。
+
+    ※ここでは
+        utility = exp(-γ PnL)
+        loss    = utility.mean()
+      としており、前回の loss = -utility.mean() とは符号が逆。
+    """
+    policy.train()
+
+    dt = T / J
+    sqrt_dt = math.sqrt(dt)
+
+    if v_max is None:
+        # 上限速度（適当なスケール）：期間中に2回分 q0 を動かせるくらい
+        v_max = 2.0 * q0 / T
+
+    # 初期条件
+    S = torch.full((batch_size, 1), S0, device=device)
+    X = torch.zeros((batch_size, 1), device=device)
+    q = torch.full((batch_size, 1), q0, device=device)
+    Q = torch.zeros((batch_size, 1), device=device)
+
+    vw_num = torch.zeros((batch_size, 1), device=device)
+    vw_den = torch.zeros((batch_size, 1), device=device)
+
+    eps_S = torch.randn(batch_size, J, device=device)
+
+    # 正規化用スケール
+    S_ref = S0
+    V_ref = V_const
+    Q_ref = V_const * T
+    q_ref = max(abs(q0), 1.0)
+
+    for j in range(J):
+        # 出来高は常に定数
+        V_t = torch.full_like(S, V_const)
+
+        # 累積出来高
+        Q = Q + V_t * dt
+
+        # 状態を正規化してNNに入力
+        S_norm = S / S_ref
+        V_norm = V_t / V_ref
+        Q_norm = Q / Q_ref
+        q_norm = q / q_ref
+        state = torch.cat([S_norm, V_norm, Q_norm, q_norm], dim=1)  # (batch, 4)
+
+        u = policy(state)          # u ∈ (-1,1)
+        v = v_max * u              # 売り・買い両方あり
+        dq = v * dt                # 実際に動かす株数（符号付き）
+
+        q_next = q - dq            # v>0 なら在庫減少, v<0 なら在庫増加
+
+        # キャッシュ更新
+        rho = v / V_t
+        L_val = eta * torch.abs(rho) ** (1.0 + phi)
+        dX = (v * S - V_t * L_val) * dt
+        X = X + dX
+
+        # 価格更新
+        dW = eps_S[:, j:j+1] * sqrt_dt
+        dS = sigma * dW - k * v * dt
+        S = S + dS
+
+        q = q_next
+
+        # VWAP 用集計
+        vw_num = vw_num + S * V_t * dt
+        vw_den = vw_den + V_t * dt
+
+    VWAP_T = vw_num / vw_den
+    pnl = X - q0 * VWAP_T
+    pnl = torch.clamp(pnl, -1e6, 1e6)
+
+    utility = torch.exp(-gamma * pnl)  # CARA効用
+    loss = utility.mean()              # ← 前回から符号を反転
+    return loss
+
+
+# =========================================
+# 学習ループ
+# =========================================
+
+def train_policy_signed_volume(
+    num_epochs: int = 2000,
+    batch_size: int = 256,
+    lr: float = 1e-3,
+    device: str = "cpu",
+) -> nn.Module:
+    policy = PolicyNet().to(device)
+    opt = optim.Adam(policy.parameters(), lr=lr)
+
+    for e in range(1, num_epochs + 1):
+        opt.zero_grad()
+        loss = simulate_batch_signed_volume(
+            policy,
+            batch_size=batch_size,
+            device=device,
+        )
+        loss.backward()
+        nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+        opt.step()
+        if e % 100 == 0:
+            print(f"epoch {e}  loss {loss.item():.6f}")
+
+    return policy
+
+
+# =========================================
+# 可視化用：複数パスの S,V,Q,q,v
+# =========================================
+
+def sample_paths_for_plot_signed(
+    policy: nn.Module,
+    n_paths: int = 5,
+    J: int = 200,
+    T: float = 1.0,
+    S0: float = 50.0,
+    q0: float = 400000.0,
+    V_const: float = 4_000_000.0,
+    sigma: float = 0.45,
+    eta: float = 0.12,
+    phi: float = 0.63,
+    k: float = 5e-7,
+    gamma: float = 3e-6,
+    v_max: float | None = None,
+    device: str = "cpu",
+):
+    policy.eval()
+    dt = T / J
+    sqrt_dt = math.sqrt(dt)
+
+    if v_max is None:
+        v_max = 2.0 * q0 / T
+
+    S = torch.full((n_paths, 1), S0, device=device)
+    X = torch.zeros((n_paths, 1), device=device)
+    q = torch.full((n_paths, 1), q0, device=device)
+    Q = torch.zeros((n_paths, 1), device=device)
+
+    eps_S = torch.randn(n_paths, J, device=device)
+
+    S_ref = S0
+    V_ref = V_const
+    Q_ref = V_const * T
+    q_ref = max(abs(q0), 1.0)
+
+    S_hist = torch.zeros(J + 1, n_paths, device=device)
+    V_hist = torch.zeros(J,     n_paths, device=device)
+    Q_hist = torch.zeros(J + 1, n_paths, device=device)
+    q_hist = torch.zeros(J + 1, n_paths, device=device)
+    v_hist = torch.zeros(J,     n_paths, device=device)
+
+    S_hist[0] = S.squeeze(1)
+    Q_hist[0] = Q.squeeze(1)
+    q_hist[0] = q.squeeze(1)
+
+    with torch.no_grad():
+        for j in range(J):
+            V_t = torch.full((n_paths, 1), V_const, device=device)
+            V_hist[j] = V_t.squeeze(1)
+
+            Q = Q + V_t * dt
+            Q_hist[j + 1] = Q.squeeze(1)
+
+            S_norm = S / S_ref
+            V_norm = V_t / V_ref
+            Q_norm = Q / Q_ref
+            q_norm = q / q_ref
+            state = torch.cat([S_norm, V_norm, Q_norm, q_norm], dim=1)
+
+            u = policy(state)
+            v = v_max * u
+            dq = v * dt
+
+            v_hist[j] = v.squeeze(1)
+            q_next = q - dq
+            q_hist[j + 1] = q_next.squeeze(1)
+
+            rho = v / V_t
+            L_val = eta * torch.abs(rho) ** (1.0 + phi)
+            dX = (v * S - V_t * L_val) * dt
+            X = X + dX
+
+            dW = eps_S[:, j:j+1] * sqrt_dt
+            dS = sigma * dW - k * v * dt
+            S = S + dS
+            S_hist[j + 1] = S.squeeze(1)
+
+            q = q_next
+
+    t_grid = torch.linspace(0.0, T, J + 1).cpu().numpy()
+    t_mid  = torch.linspace(0.0, T, J).cpu().numpy()
+
+    return (
+        t_grid,
+        t_mid,
+        S_hist.cpu().numpy(),
+        V_hist.cpu().numpy(),
+        Q_hist.cpu().numpy(),
+        q_hist.cpu().numpy(),
+        v_hist.cpu().numpy(),
+    )
+
+
+# =========================================
+# 可視化用：テストパス1本
+# =========================================
+
+def sample_single_test_path_signed(
+    policy: nn.Module,
+    J: int = 200,
+    T: float = 1.0,
+    S0: float = 50.0,
+    q0: float = 400000.0,
+    V_const: float = 4_000_000.0,
+    sigma: float = 0.45,
+    eta: float = 0.12,
+    phi: float = 0.63,
+    k: float = 5e-7,
+    gamma: float = 3e-6,
+    v_max: float | None = None,
+    device: str = "cpu",
+):
+    policy.eval()
+    dt = T / J
+    sqrt_dt = math.sqrt(dt)
+
+    if v_max is None:
+        v_max = 2.0 * q0 / T
+
+    S = torch.full((1, 1), S0, device=device)
+    X = torch.zeros((1, 1), device=device)
+    q = torch.full((1, 1), q0, device=device)
+    Q = torch.zeros((1, 1), device=device)
+
+    eps_S = torch.randn(1, J, device=device)
+
+    S_ref = S0
+    V_ref = V_const
+    Q_ref = V_const * T
+    q_ref = max(abs(q0), 1.0)
+
+    S_hist = torch.zeros(J + 1, device=device)
+    V_hist = torch.zeros(J,     device=device)
+    Q_hist = torch.zeros(J + 1, device=device)
+    q_hist = torch.zeros(J + 1, device=device)
+    v_hist = torch.zeros(J,     device=device)
+
+    S_hist[0] = S.item()
+    Q_hist[0] = Q.item()
+    q_hist[0] = q.item()
+
+    with torch.no_grad():
+        for j in range(J):
+            V_t = torch.full((1, 1), V_const, device=device)
+            V_hist[j] = V_t.item()
+
+            Q = Q + V_t * dt
+            Q_hist[j + 1] = Q.item()
+
+            S_norm = S / S_ref
+            V_norm = V_t / V_ref
+            Q_norm = Q / Q_ref
+            q_norm = q / q_ref
+            state = torch.cat([S_norm, V_norm, Q_norm, q_norm], dim=1)
+
+            u = policy(state)
+            v = v_max * u
+            dq = v * dt
+
+            v_hist[j] = v.item()
+            q_next = q - dq
+            q_hist[j + 1] = q_next.item()
+
+            rho = v / V_t
+            L_val = eta * torch.abs(rho) ** (1.0 + phi)
+            dX = (v * S - V_t * L_val) * dt
+            X = X + dX
+
+            dW = eps_S[:, j:j+1] * sqrt_dt
+            dS = sigma * dW - k * v * dt
+            S = S + dS
+            S_hist[j + 1] = S.item()
+
+            q = q_next
+
+    t_grid = torch.linspace(0.0, T, J + 1).cpu().numpy()
+    t_mid  = torch.linspace(0.0, T, J).cpu().numpy()
+
+    return (
+        t_grid,
+        t_mid,
+        S_hist.cpu().numpy(),
+        V_hist.cpu().numpy(),
+        Q_hist.cpu().numpy(),
+        q_hist.cpu().numpy(),
+        v_hist.cpu().numpy(),
+    )
+
+
+# =========================================
+# 実行部（VS Code でそのまま実行）
+# =========================================
+
+# 学習したくない場合は、次の2行をコメントアウトして、
+# policy = PolicyNet().to(device) だけにする。
+print("training start")
+policy = train_policy_signed_volume(
+    num_epochs=1000,
+    batch_size=512,
+    lr=1e-3,
+    device=device,
+)
+print("training done")
+
+# 複数パスの可視化
+t_grid, t_mid, S_h, V_h, Q_h, q_h, v_h = sample_paths_for_plot_signed(
+    policy,
+    n_paths=5,
+    device=device,
+)
+
+plt.figure()
+for i in range(S_h.shape[1]):
+    plt.plot(t_grid, S_h[:, i])
+plt.xlabel("t"); plt.ylabel("S_t"); plt.title("Sample paths: S_t"); plt.grid(True)
+
+plt.figure()
+for i in range(V_h.shape[1]):
+    plt.plot(t_mid, V_h[:, i])
+plt.xlabel("t"); plt.ylabel("V_t"); plt.title("Sample paths: V_t (constant)"); plt.grid(True)
+
+plt.figure()
+for i in range(Q_h.shape[1]):
+    plt.plot(t_grid, Q_h[:, i])
+plt.xlabel("t"); plt.ylabel("Q_t"); plt.title("Sample paths: Q_t"); plt.grid(True)
+
+plt.figure()
+for i in range(q_h.shape[1]):
+    plt.plot(t_grid, q_h[:, i])
+plt.xlabel("t"); plt.ylabel("q_t"); plt.title("Sample paths: inventory q_t (signed)"); plt.grid(True)
+
+plt.figure()
+for i in range(v_h.shape[1]):
+    plt.plot(t_mid, v_h[:, i])
+plt.xlabel("t"); plt.ylabel("v_t"); plt.title("Sample paths: trading speed v_t (signed)"); plt.grid(True)
+
+# テストパス1本
+t_grid, t_mid, S_p, V_p, Q_p, q_p, v_p = sample_single_test_path_signed(
+    policy,
+    J=200,
+    T=1.0,
+    device=device,
+)
+
+plt.figure()
+plt.plot(t_grid, S_p)
+plt.xlabel("t"); plt.ylabel("S_t"); plt.title("Single path: S_t"); plt.grid(True)
+
+plt.figure()
+plt.plot(t_grid, q_p)
+plt.xlabel("t"); plt.ylabel("q_t"); plt.title("Single path: inventory q_t (signed)"); plt.grid(True)
+
+plt.figure()
+plt.plot(t_mid, v_p)
+plt.xlabel("t"); plt.ylabel("v_t"); plt.title("Single path: trading speed v_t (signed)"); plt.grid(True)
+
+plt.show()
