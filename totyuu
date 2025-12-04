@@ -1,0 +1,152 @@
+import math, torch, torch.nn as nn, torch.optim as optim, matplotlib.pyplot as plt
+
+torch.set_default_dtype(torch.float64)  # ★ ここで倍精度をデフォルトにする
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+S0, q0, V0 = 50.0, 400000.0, 4_000_000.0
+sigma_S, eta, phi, k, gamma = 0.45, 0.12, 0.63, 5e-7, 3e-6
+mu_V, sigma_V = 0.0, 0.3
+lambda_qT = 1e-3
+T, J = 1.0, 200
+num_epochs, batch_size, hidden_dim = 1000, 256, 128
+LR, OPT, WD, M = 1e-2, "Adam", 0.0, 0.9
+
+dt, sqrt_dt = T / J, math.sqrt(T / J)
+S_ref, V_ref, Q_ref = S0, V0, V0 * T
+q_ref = max(abs(q0), 1.0)
+
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.v_max = 5 * q0 / T
+        self.base = nn.Sequential(
+            nn.Linear(4, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU()
+        )
+        self.heads = nn.ModuleList([nn.Linear(hidden_dim, 1) for _ in range(J)])
+    def forward(self, x, j: int):
+        h = self.base(x)
+        return self.v_max * torch.tanh(self.heads[j](h))
+
+def make_optim(net):
+    if OPT == "Adam":
+        return optim.Adam(net.parameters(), lr=LR, weight_decay=WD)
+    if OPT == "AdamW":
+        return optim.AdamW(net.parameters(), lr=LR, weight_decay=WD)
+    return optim.SGD(net.parameters(), lr=LR, momentum=M, weight_decay=WD)
+
+def simulate_batch(net: Net):
+    S = torch.full((batch_size, 1), S0, device=device, dtype=torch.float64)
+    q = torch.full((batch_size, 1), q0, device=device, dtype=torch.float64)
+    X = torch.zeros((batch_size, 1), device=device, dtype=torch.float64)
+    Q = torch.zeros((batch_size, 1), device=device, dtype=torch.float64)
+    V = torch.full((batch_size, 1), V0, device=device, dtype=torch.float64)
+    vwN = torch.zeros((batch_size, 1), device=device, dtype=torch.float64)
+    vwD = torch.zeros((batch_size, 1), device=device, dtype=torch.float64)
+
+    eS = torch.randn(batch_size, J, device=device, dtype=torch.float64)
+    eV = torch.randn(batch_size, J, device=device, dtype=torch.float64)
+
+    net.train()
+    for j in range(J):
+        dWV = eV[:, j:j+1] * sqrt_dt
+        V = V * torch.exp((mu_V - 0.5 * sigma_V**2) * dt + sigma_V * dWV)
+        V = torch.clamp(V, min=1e-6)
+
+        st = torch.cat([S / S_ref, V / V_ref, Q / Q_ref, q / q_ref], dim=1)
+        v = net(st, j)
+        dq = v * dt
+        q1 = q - dq
+
+        rho = v / V
+        L = eta * torch.abs(rho) ** (1 + phi)
+        X = X + (v * S - V * L) * dt
+
+        dWS = eS[:, j:j+1] * sqrt_dt
+        S = S + sigma_S * dWS - k * v * dt
+
+        Q = Q + V * dt
+        vwN = vwN + S * V * dt
+        vwD = vwD + V * dt
+
+        q = q1
+
+    VWAP = vwN / vwD
+    pnl = X - q0 * VWAP          # ここでは clamp しない方が Var 推定は素直
+    # pnl = torch.clamp(pnl, -1e6, 1e6)  # 必要なら数値安定用に軽くクランプしても良い
+
+    # バッチ上で平均と分散を計算
+    pnl_mean = pnl.mean()
+    pnl2_mean = (pnl ** 2).mean()
+    pnl_var = pnl2_mean - pnl_mean ** 2
+
+    # 近似的な certainty equivalent
+    ce_approx = pnl_mean - 0.5 * gamma * pnl_var
+
+    # q_T は現在の q （J ステップ後）
+    qT = q.squeeze(1)
+    loss = -ce_approx + lambda_qT * (qT ** 2).mean()
+
+    return loss
+
+
+@torch.no_grad()
+def sample_single_path(net: Net):
+    S = torch.full((1, 1), S0, device=device, dtype=torch.float64)
+    q = torch.full((1, 1), q0, device=device, dtype=torch.float64)
+    Q = torch.zeros((1, 1), device=device, dtype=torch.float64)
+    V = torch.full((1, 1), V0, device=device, dtype=torch.float64)
+    eS = torch.randn(1, J, device=device, dtype=torch.float64)
+    eV = torch.randn(1, J, device=device, dtype=torch.float64)
+    S_h = torch.zeros(J + 1, dtype=torch.float64)
+    q_h = torch.zeros(J + 1, dtype=torch.float64)
+    v_h = torch.zeros(J, dtype=torch.float64)
+    V_h = torch.zeros(J + 1, dtype=torch.float64)
+    S_h[0], q_h[0], V_h[0] = S.item(), q.item(), V.item()
+    net.eval()
+    for j in range(J):
+        dWV = eV[:, j:j+1] * sqrt_dt
+        V = V * torch.exp((mu_V - 0.5 * sigma_V**2) * dt + sigma_V * dWV)
+        V = torch.clamp(V, min=1e-6)
+        V_h[j + 1] = V.item()
+        st = torch.cat([S / S_ref, V / V_ref, Q / Q_ref, q / q_ref], dim=1)
+        v = net(st, j)
+        dq = v * dt
+        v_h[j] = v.item()
+        q1 = q - dq
+        q_h[j + 1] = q1.item()
+        dWS = eS[:, j:j+1] * sqrt_dt
+        S = S + sigma_S * dWS - k * v * dt
+        S_h[j + 1] = S.item()
+        Q = Q + V * dt
+        q = q1
+    t = torch.linspace(0, T, J + 1, dtype=torch.float64).cpu().numpy()
+    return t, S_h.numpy(), q_h.numpy(), v_h.numpy(), V_h.numpy()
+
+def train_with_snapshots():
+    net = Net().to(device)
+    opt = make_optim(net)
+    q_paths = {}
+    for ep in range(1, num_epochs + 1):
+        loss = simulate_batch(net)
+        opt.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        opt.step()
+        if ep % 50 == 0:
+            print("epoch", ep, "loss", loss.item())
+            t, S_h, q_h, v_h, V_h = sample_single_path(net)
+            q_paths[ep] = (t, q_h)
+    return net, q_paths
+
+net, q_paths = train_with_snapshots()
+plt.figure(figsize=(6, 4))
+for ep, (t, q_h) in q_paths.items():
+    plt.plot(t, q_h, label=f"epoch {ep}")
+plt.title("q_t snapshots (every 50 epochs)")
+plt.xlabel("t")
+plt.ylabel("q_t")
+plt.grid(True)
+plt.legend()
+plt.show()
