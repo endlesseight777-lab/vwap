@@ -1,0 +1,234 @@
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+
+torch.set_default_dtype(torch.float64)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# -----------------------------
+# モデル & 市場パラメータ
+# -----------------------------
+S0, q0, V0 = 50.0, 400000.0, 4_000_000.0
+sigma_S, eta, phi, k, gamma = 0.45, 0.12, 0.63, 5e-7, 3e-6
+mu_V, sigma_V = 0.0, 0.3
+lambda_qT = 1e-3
+
+T, J = 1.0, 200
+num_epochs, batch_size, hidden_dim = 1000, 256, 128
+LR, OPT, WD, M = 1e-2, "Adam", 0.0, 0.9
+
+dt, sqrt_dt = T / J, math.sqrt(T / J)
+S_ref, V_ref, Q_ref = S0, V0, V0 * T
+q_ref = max(abs(q0), 1.0)
+
+
+# -----------------------------
+# ネットワーク（GELU + clamp）
+# -----------------------------
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # v は [-v_max, v_max] に clamp
+        self.v_max = 5 * q0 / T
+
+        # base: GELU 活性
+        self.base = nn.Sequential(
+            nn.Linear(4, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        # 各時刻 j ごとのヘッド
+        self.heads = nn.ModuleList([nn.Linear(hidden_dim, 1) for _ in range(J)])
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # base の初期化（小さめの Xavier, bias=0）
+        for m in self.base:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                nn.init.constant_(m.bias, 0.0)
+
+        # 初期状態で「一定速度売り」になるようにヘッドのバイアスを設定
+        # v_target = q0 / T
+        v_target = q0 / T
+
+        for head in self.heads:
+            # 入力に依らずほぼ一定になるよう weight=0
+            nn.init.constant_(head.weight, 0.0)
+            # GELU(x) ~ x (x >> 0) なので、bias ≈ v_target にしておく
+            nn.init.constant_(head.bias, v_target)
+
+    def forward(self, x, j: int):
+        h = self.base(x)
+        z = self.heads[j](h)                    # (batch, 1)
+        v_raw = torch.nn.functional.gelu(z)     # 対称売買許可（正負両方）だが主に正側
+        v = torch.clamp(v_raw, -self.v_max, self.v_max)
+        return v
+
+
+# -----------------------------
+# Optimizer
+# -----------------------------
+def make_optim(net):
+    if OPT == "Adam":
+        return optim.Adam(net.parameters(), lr=LR, weight_decay=WD)
+    if OPT == "AdamW":
+        return optim.AdamW(net.parameters(), lr=LR, weight_decay=WD)
+    return optim.SGD(net.parameters(), lr=LR, momentum=M, weight_decay=WD)
+
+
+# -----------------------------
+# シミュレーション（1バッチ）
+# -----------------------------
+def simulate_batch(net: Net):
+    S = torch.full((batch_size, 1), S0, device=device)
+    q = torch.full((batch_size, 1), q0, device=device)
+    X = torch.zeros((batch_size, 1), device=device)
+    Q = torch.zeros((batch_size, 1), device=device)
+    V = torch.full((batch_size, 1), V0, device=device)
+    vwN = torch.zeros((batch_size, 1), device=device)
+    vwD = torch.zeros((batch_size, 1), device=device)
+    eS = torch.randn(batch_size, J, device=device)
+    eV = torch.randn(batch_size, J, device=device)
+
+    net.train()
+    for j in range(J):
+        # 体積プロセス
+        dWV = eV[:, j:j+1] * sqrt_dt
+        V = V * torch.exp((mu_V - 0.5 * sigma_V**2) * dt + sigma_V * dWV)
+        V = torch.clamp(V, min=1e-6)
+
+        # 状態を正規化して入力
+        st = torch.cat([S / S_ref, V / V_ref, Q / Q_ref, q / q_ref], dim=1)
+        v = net(st, j)       # (batch, 1)
+        dq = v * dt
+        q1 = q - dq
+
+        # 一時的インパクト
+        rho = v / V
+        L = eta * torch.abs(rho) ** (1 + phi)
+
+        # 現金
+        X = X + (v * S - V * L) * dt
+
+        # 価格プロセス
+        dWS = eS[:, j:j+1] * sqrt_dt
+        S = S + sigma_S * dWS - k * v * dt
+
+        # VWAP 用
+        Q = Q + V * dt
+        vwN = vwN + S * V * dt
+        vwD = vwD + V * dt
+
+        q = q1
+
+    VWAP = vwN / vwD
+    pnl = X - q0 * VWAP
+    pnl_mean = pnl.mean()
+    pnl2_mean = (pnl ** 2).mean()
+    pnl_var = pnl2_mean - pnl_mean ** 2
+    ce_approx = pnl_mean - 0.5 * gamma * pnl_var
+
+    qT = q.squeeze(1)
+    loss = -ce_approx + lambda_qT * (qT ** 2).mean()
+    return loss
+
+
+# -----------------------------
+# 単一パスのサンプル（可視化用）
+# -----------------------------
+@torch.no_grad()
+def sample_single_path(net: Net):
+    S = torch.full((1, 1), S0, device=device)
+    q = torch.full((1, 1), q0, device=device)
+    Q = torch.zeros((1, 1), device=device)
+    V = torch.full((1, 1), V0, device=device)
+    eS = torch.randn(1, J, device=device)
+    eV = torch.randn(1, J, device=device)
+
+    S_h = torch.zeros(J + 1)
+    q_h = torch.zeros(J + 1)
+    v_h = torch.zeros(J)
+    V_h = torch.zeros(J + 1)
+
+    S_h[0], q_h[0], V_h[0] = S.item(), q.item(), V.item()
+
+    net.eval()
+    for j in range(J):
+        dWV = eV[:, j:j+1] * sqrt_dt
+        V = V * torch.exp((mu_V - 0.5 * sigma_V**2) * dt + sigma_V * dWV)
+        V = torch.clamp(V, min=1e-6)
+        V_h[j + 1] = V.item()
+
+        st = torch.cat([S / S_ref, V / V_ref, Q / Q_ref, q / q_ref], dim=1)
+        v = net(st, j)
+        dq = v * dt
+        v_h[j] = v.item()
+        q1 = q - dq
+        q_h[j + 1] = q1.item()
+
+        dWS = eS[:, j:j+1] * sqrt_dt
+        S = S + sigma_S * dWS - k * v * dt
+        S_h[j + 1] = S.item()
+
+        Q = Q + V * dt
+        q = q1
+
+    t = torch.linspace(0, T, J + 1, dtype=torch.float64).cpu().numpy()
+    return t, S_h.numpy(), q_h.numpy(), v_h.numpy(), V_h.numpy()
+
+
+# -----------------------------
+# 学習ループ＋スナップショット
+# -----------------------------
+def train_with_snapshots():
+    net = Net().to(device)
+    opt = make_optim(net)
+    q_paths = {}
+    loss_hist = []
+
+    for ep in range(1, num_epochs + 1):
+        loss = simulate_batch(net)
+        loss_value = loss.item()
+        loss_hist.append(loss_value)
+
+        opt.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        opt.step()
+
+        if ep % 50 == 0:
+            print(f"epoch {ep}, loss {loss_value}")
+            t, S_h, q_h, v_h, V_h = sample_single_path(net)
+            q_paths[ep] = (t, q_h)
+
+    return net, q_paths, loss_hist
+
+
+# -----------------------------
+# 実行
+# -----------------------------
+net, q_paths, loss_hist = train_with_snapshots()
+
+plt.figure(figsize=(6, 4))
+plt.plot(loss_hist)
+plt.xlabel("epoch")
+plt.ylabel("loss")
+plt.title("Loss per epoch (GELU + clamp)")
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(6, 4))
+for ep, (t, q_h) in q_paths.items():
+    plt.plot(t, q_h, label=f"epoch {ep}")
+plt.title("q_t snapshots (every 50 epochs)")
+plt.xlabel("t")
+plt.ylabel("q_t")
+plt.grid(True)
+plt.legend()
+plt.show()
