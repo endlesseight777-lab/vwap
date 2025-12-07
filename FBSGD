@@ -1,0 +1,525 @@
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+
+# ======================================================
+# 基本設定
+# ======================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_default_dtype(torch.float32)  # 必要なら float64 に変えてOK
+
+print("device =", device)
+if torch.cuda.is_available():
+    i = torch.cuda.current_device()
+    print("GPU index =", i)
+    print("GPU name  =", torch.cuda.get_device_name(i))
+    p = torch.cuda.get_device_properties(i)
+    print(f"memory [GB]      = {p.total_memory/1024**3:.2f}")
+    print("multiprocessors  =", p.multi_processor_count)
+    print("compute capability =", p.major, ".", p.minor, sep="")
+
+
+# ======================================================
+# 0. FBSDEProblem（基底クラス）
+# ======================================================
+class FBSDEProblem:
+    def __init__(self, x0, T, dim_x=1, dim_y=1, dim_d=1):
+        self.dim_x = dim_x
+        self.dim_y = dim_y
+        self.dim_d = dim_d
+        self.T = T  # 無次元時間 [0,1] を想定
+
+        x0 = np.array(x0, dtype=np.float32).reshape(1, dim_x)
+        self.x0 = torch.tensor(x0, device=device)
+
+    def b(self, t, x, y):
+        return torch.zeros_like(x)
+
+    def sigma(self, t, x):
+        batch = x.shape[0]
+        return torch.zeros(batch, self.dim_x, self.dim_d, device=device)
+
+    def f(self, t, x, y, z):
+        return torch.zeros(x.shape[0], self.dim_y, device=device)
+
+    def g(self, x):
+        return torch.zeros(x.shape[0], self.dim_y, device=device)
+
+
+# ======================================================
+# 1. DeepFBSDE Model（Z-network + 前進・後退）
+# ======================================================
+class DeepFBSDEModel(nn.Module):
+    """
+    与えられた FBSDEProblem eq に対して
+        dX_t = b dt + sigma dW
+        dY_t = -f dt + Z dW,  Y_T = g(X_T)
+    を Euler で前進させるネットワーク。
+    - Y0 を学習パラメータとして持つ
+    - Z(t,X_t) を NN(phi) で近似する
+    """
+
+    def __init__(self, eq: FBSDEProblem, hidden_dim=128, n_layers=3):
+        super().__init__()
+        self.eq = eq
+
+        in_dim = eq.dim_x + 1     # (X_t, t)
+        out_dim = eq.dim_y * eq.dim_d
+
+        layers = []
+        last = in_dim
+        for _ in range(n_layers):
+            layers.append(nn.Linear(last, hidden_dim))
+            layers.append(nn.ReLU())
+            last = hidden_dim
+        self.mlp = nn.Sequential(*layers)
+        self.out = nn.Linear(last, out_dim)
+
+        # Y0（初期価値）は学習パラメータ
+        self.y0 = nn.Parameter(torch.zeros(eq.dim_y, device=device))
+
+    def phi(self, xt):
+        """
+        xt: [batch, dim_x+1] (X_t と t を結合したもの)
+        戻り値: Z_t ∈ R^{batch × dim_y × dim_d}
+        """
+        h = self.mlp(xt)
+        z_flat = self.out(h)
+        return z_flat.view(-1, self.eq.dim_y, self.eq.dim_d)
+
+    def forward(self, batch, N):
+        """
+        batch 本のパスについて [0,T] を N ステップで Euler 積分。
+        戻り値: X_T, Y_T
+        """
+        dt = self.eq.T / N
+        dim_x = self.eq.dim_x
+        dim_d = self.eq.dim_d
+        dim_y = self.eq.dim_y
+
+        # Brown 運動
+        dW = torch.randn(batch, dim_d, N, device=device) * math.sqrt(dt)
+
+        # 初期状態
+        x = self.eq.x0.repeat(batch, 1)
+        y = self.y0.unsqueeze(0).repeat(batch, 1)
+
+        for n in range(N):
+            t = n * dt
+            t_tensor = torch.full((batch, 1), t, device=device)
+            xt = torch.cat([x, t_tensor], dim=1)
+
+            z = self.phi(xt)               # [batch, dim_y, dim_d]
+            dW_n = dW[:, :, n].unsqueeze(-1)  # [batch, dim_d, 1]
+
+            x_old, y_old = x, y
+            b_val = self.eq.b(t, x_old, y_old)       # [batch, dim_x]
+            sigma_val = self.eq.sigma(t, x_old)      # [batch, dim_x, dim_d]
+
+            # X の更新
+            x = x_old + b_val * dt + torch.matmul(sigma_val, dW_n).view(-1, dim_x)
+
+            # Y の更新
+            f_val = self.eq.f(t, x_old, y_old, z)    # [batch, dim_y]
+            y = y_old - f_val * dt + torch.matmul(z, dW_n).view(-1, dim_y)
+
+        return x, y
+
+
+# ======================================================
+# 2. Trainer
+# ======================================================
+class DeepFBSDETrainer:
+    """
+    終端条件 Y_T = g(X_T) が成り立つように
+    MSE(g(X_T), Y_T) を最小化して Y0 と Z-network を学習する。
+    """
+
+    def __init__(self, eq: FBSDEProblem, hidden_dim=128, n_layers=3):
+        self.eq = eq
+        self.model = DeepFBSDEModel(eq, hidden_dim, n_layers).to(device)
+
+    def train(self, batch=512, N_time=50, n_iter=5000, lr=1e-3, log_interval=500):
+        opt = torch.optim.Adam(self.model.parameters(), lr=lr)
+        loss_fn = nn.MSELoss()
+
+        for it in range(1, n_iter + 1):
+            x_T, y_T = self.model(batch, N_time)
+            g_T = self.eq.g(x_T)
+            loss = loss_fn(g_T, y_T)
+
+            if not torch.isfinite(loss):
+                print("NaN detected, stopping at iter", it)
+                break
+
+            # 簡単なステップダウン
+            if it == n_iter // 2:
+                for g in opt.param_groups:
+                    g["lr"] = lr * 0.1
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            if it % log_interval == 0:
+                print(f"[iter {it:6d}] loss={loss.item():.3e}")
+
+    @torch.no_grad()
+    def evaluate_y0(self):
+        return float(self.model.y0.detach().cpu().numpy()[0])
+
+
+# ======================================================
+# 3. 無次元化 ζ-HJB FBSDE クラス (F(z)=k z, h(q) 正式版)
+# ======================================================
+class ZetaFBSDE_ND(FBSDEProblem):
+    """
+    無次元状態 X~ = (Y~, q~, Q~, V~)
+    物理値 → 無次元化して HJB を FBSDE で解く。
+
+    HJB:
+        L0 ζ + (σ^2 γ /2) (q - q0)^2 - V H(∂q ζ) = 0
+        ζ(T, y,q,Q,V) = -Y/Q + h(q)
+
+    ここで F(z) = k_F * z,
+        H(p) = p^2/(4η),
+        h(q) = -∫_0^q F(z) dz + q F(q0 - q) + K q^2
+    """
+
+    def __init__(self,
+                 # 物理時間 T
+                 T_phys,
+                 # 初期物理値
+                 y0_phys, q0_phys, Q0_phys, V0_phys,
+                 # スケール
+                 Q_ref, V_ref, Y_ref,
+                 # 物理パラメータ
+                 sigma_phys, alpha_phys, gamma_phys,
+                 eps_phys, eta_phys,
+                 k_F_phys,   # F(z)=k_F * z の k_F
+                 K_h_phys,   # h(q) の K
+                 # g'/g(t)
+                 gprime_over_g_phys):
+
+        # --- 無次元初期値 ---
+        y0_nd = y0_phys / Y_ref
+        q0_nd = q0_phys / Q_ref
+        Q0_nd = Q0_phys / Q_ref
+        V0_nd = V0_phys / V_ref
+
+        super().__init__(x0=[y0_nd, q0_nd, Q0_nd, V0_nd],
+                         T=1.0, dim_x=4, dim_y=1, dim_d=3)
+
+        # 物理値を保存（q(t) 再構成にも使う）
+        self.T_phys = T_phys
+        self.y0_phys = y0_phys
+        self.q0_phys = q0_phys
+        self.Q0_phys = Q0_phys
+        self.V0_phys = V0_phys
+
+        self.Q_ref = Q_ref
+        self.V_ref = V_ref
+        self.Y_ref = Y_ref
+
+        self.sigma_phys = sigma_phys
+        self.alpha_phys = alpha_phys
+        self.gamma_phys = gamma_phys
+        self.eps_phys = eps_phys
+        self.eta_phys = eta_phys
+        self.k_F_phys = k_F_phys
+        self.K_h_phys = K_h_phys
+        self.gprime_over_g_phys = gprime_over_g_phys
+
+        # --- 無次元パラメータ ---
+        T = T_phys
+        q0 = q0_phys
+        sigma = sigma_phys
+        alpha = alpha_phys
+        eps = eps_phys
+
+        self.A1 = (V_ref * T * q0) / Y_ref          # dY~ の drift 用
+        self.B1 = (q0 * sigma * Q_ref * math.sqrt(T)) / Y_ref
+        self.C1 = (V_ref * T) / Q_ref
+
+        self.eps_nd = eps / (Q_ref * math.sqrt(T))
+        self.alpha_nd = alpha * math.sqrt(T)
+
+        # リスク項係数（無次元）
+        self.risk_coeff_nd = 0.5 * sigma**2 * gamma_phys * (Q_ref**2)
+
+    # drift b(t_nd, x_nd, y_nd)
+    def b(self, t_nd, x, y):
+        """
+        X~ = (Y~, q~, Q~, V~) に対する drift
+        """
+        Y_nd = x[:, 0]
+        q_nd = x[:, 1]
+        Q_nd = x[:, 2]
+        V_nd = x[:, 3]
+
+        q_phys = self.Q_ref * q_nd
+        V_phys = self.V_ref * V_nd
+
+        # F(q0 - q) = k_F * (q0 - q)
+        Fv = self.k_F_phys * (self.q0_phys - q_phys)
+
+        # dY~/dt_nd = (T/Y_ref) * dY_phys/dt_phys = A1 * V_nd * Fv
+        bY = self.A1 * V_nd * Fv
+
+        # q~ は drift 0（拡散のみ）
+        bq = torch.zeros_like(q_nd)
+
+        # dQ~/dt_nd = (T/Q_ref) * dQ_phys/dt_phys = C1 * V_nd
+        bQ = self.C1 * V_nd
+
+        # g'/g 部分
+        t_phys = self.T_phys * t_nd
+        gpg = self.gprime_over_g_phys(float(t_phys))
+        if not torch.is_tensor(gpg):
+            gpg = torch.tensor(gpg, device=x.device)
+        bV = V_nd * gpg
+
+        return torch.stack([bY, bq, bQ, bV], dim=1)
+
+    # diffusion sigma(t_nd, x_nd)
+    def sigma(self, t_nd, x):
+        """
+        Brown 運動 3次元 (W1, W2, W3) に対して
+          - Y~ に W1 ノイズ
+          - q~ に W2 ノイズ（正則化用）
+          - V~ に W3 ノイズ
+        """
+        q_nd = x[:, 1]
+        Q_nd = x[:, 2]
+        V_nd = x[:, 3]
+
+        batch = x.shape[0]
+        out = torch.zeros(batch, 4, 3, device=x.device)
+
+        out[:, 0, 0] = self.B1 * Q_nd       # dY~
+        out[:, 1, 1] = self.eps_nd          # dq~
+        out[:, 3, 2] = self.alpha_nd * V_nd # dV~
+
+        return out
+
+    # driver f(t_nd, x_nd, y_nd, z_nd)
+    def f(self, t_nd, x, y, z):
+        """
+        driver:
+          f = term_yV + term_risk + term_H
+
+        HJB の
+          (σ^2 γ /2) (q-q0)^2 - V H(∂qζ)
+        に対応するのが term_risk + term_H。
+        term_yV は Cole–Hopf 変換由来の |Z|^2/(2γ) 型項。
+        """
+        z1 = z[:, 0, 0]
+        z2 = z[:, 0, 1]
+        z3 = z[:, 0, 2]
+
+        q_nd = x[:, 1]
+        V_nd = x[:, 3]
+
+        q0_nd = self.q0_phys / self.Q_ref
+
+        # |Z|^2 / (2γ) 的な項（Y,W1 と V,W3 のノイズ）
+        term_yV = (z1**2 + z3**2) / (2.0 * self.gamma_phys)
+
+        # リスク項: (σ^2 γ /2) (q-q0)^2 （無次元化されて risk_coeff_nd に吸収）
+        term_risk = self.risk_coeff_nd * (q_nd - q0_nd)**2
+
+        # H 項（物理スケールに戻す）
+        # ∂ζ/∂q_nd ≈ z2 / eps_nd
+        # ∂ζ/∂q_phys = (1/Q_ref) ∂ζ/∂q_nd ≈ z2 / (eps_nd * Q_ref)
+        p_phys = z2 / (self.eps_nd * self.Q_ref + 1e-12)
+        # L(ρ)=ηρ^2 → H(p)=p^2/(4η)
+        Hval = (p_phys * p_phys) / (4.0 * self.eta_phys)
+        V_phys = self.V_ref * V_nd
+        term_H = - V_phys * Hval
+
+        return (term_yV + term_risk + term_H).view(-1, 1)
+
+    # terminal condition g(x_nd)
+    def g(self, x):
+        """
+        ζ(T,y,q,Q,V) = -Y/Q + h(q)
+        h(q) = -∫_0^q F(z) dz + q F(q0-q) + K q^2
+             = -0.5*k_F*q^2 + q * k_F*(q0-q) + K q^2
+        """
+        Y_nd = x[:, 0]
+        q_nd = x[:, 1]
+        Q_nd = x[:, 2]
+
+        Y_phys = self.Y_ref * Y_nd
+        q_phys = self.Q_ref * q_nd
+        Q_phys = self.Q_ref * Q_nd
+
+        # ∫_0^q F(z) dz = ∫_0^q k_F z dz = 0.5 * k_F * q^2
+        integral_F = 0.5 * self.k_F_phys * q_phys * q_phys
+        F_q0_minus_q = self.k_F_phys * (self.q0_phys - q_phys)
+
+        h_val = - integral_F + q_phys * F_q0_minus_q + self.K_h_phys * q_phys * q_phys
+
+        val = -Y_phys / Q_phys + h_val
+        return val.view(-1, 1)
+
+
+# ======================================================
+# 4. 学習済みネットから「最適 q(t) 軌道」を出す関数
+# ======================================================
+@torch.no_grad()
+def compute_optimal_q_trajectory(problem: ZetaFBSDE_ND,
+                                 trainer: DeepFBSDETrainer,
+                                 N_time=100):
+    """
+    学習済み DeepFBSDE モデルから
+      p_phys = ∂ζ/∂q_phys ≈ Z2 / (eps_nd * Q_ref)
+      ρ*(t)  = p_phys / (2η)   （L(ρ)=ηρ^2 の場合）
+    として決定論的 ODE
+      dq/dt = -ρ*(t)
+    を陽的 Euler で積分し、q(t) を返す。
+    """
+
+    model = trainer.model
+    model.eval()
+
+    T = problem.T_phys
+    dt = T / N_time
+
+    # 物理状態の初期値
+    y = float(problem.y0_phys)
+    q = float(problem.q0_phys)
+    Q = float(problem.Q0_phys)
+    V = float(problem.V0_phys)
+
+    times = [0.0]
+    qs = [q]
+
+    # 線形清算のペース q0/T を基準にクリップ
+    rho_lin = q / T
+    rho_max = 5.0 * abs(rho_lin)  # 最大でも線形ペースの5倍までに制限
+
+    for n in range(N_time):
+        t_phys = n * dt
+        t_nd = t_phys / T
+
+        # 無次元状態へ変換
+        y_nd = y / problem.Y_ref
+        q_nd = q / problem.Q_ref
+        Q_nd = Q / problem.Q_ref
+        V_nd = V / problem.V_ref
+
+        x_nd = torch.tensor([[y_nd, q_nd, Q_nd, V_nd]], device=device)
+        t_tensor = torch.tensor([[t_nd]], device=device)
+        xt = torch.cat([x_nd, t_tensor], dim=1)
+
+        # NN から Z を取得
+        z = model.phi(xt)   # [1,1,3]
+        z2_nd = float(z[0, 0, 1].item())
+
+        # ∂ζ/∂q_phys の推定
+        denom = problem.eps_nd * problem.Q_ref + 1e-12
+        p_phys = z2_nd / denom
+
+        # L(ρ)=ηρ^2 → ρ* = p / (2η)
+        rho_star = p_phys / (2.0 * problem.eta_phys)
+
+        # 数値的安全のためにクリップ
+        if not math.isfinite(rho_star):
+            rho_star = 0.0
+        else:
+            rho_star = max(min(rho_star, rho_max), -rho_max)
+
+        # ---- 決定論的 ODE で状態を更新（ノイズなし）----
+        # dq/dt = -ρ*
+        q = q - rho_star * dt
+        # （必要なら q を [0,q0] にクリップしてもいい）
+        # q = max(0.0, min(q, problem.q0_phys))
+
+        # dQ/dt = V
+        Q = Q + V * dt
+
+        # dV/dt = V * g'/g
+        gpg = problem.gprime_over_g_phys(t_phys)
+        V = V * (1.0 + gpg * dt)
+
+        # dY/dt = V q0 F(q0 - q) = V * q0 * k_F * (q0 - q)
+        Fv = problem.k_F_phys * (problem.q0_phys - q)
+        y = y + V * problem.q0_phys * Fv * dt
+
+        # NaN/inf チェック
+        if not (math.isfinite(q) and math.isfinite(Q) and math.isfinite(V) and math.isfinite(y)):
+            print(f"[warning] non-finite value at step {n}, stopping integration.")
+            break
+
+        times.append(t_phys + dt)
+        qs.append(q)
+
+    return np.array(times), np.array(qs)
+
+
+# ======================================================
+# 5. テスト実行（F(z)=kz, h(q) 正式版）
+# ======================================================
+if __name__ == "__main__":
+    # 物理時間
+    T_phys = 1.0
+
+    # 物理初期値（論文スケール）
+    y0_phys = 0.0
+    q0_phys = 400000.0
+    Q0_phys = 400000.0
+    V0_phys = 4_000_000.0
+
+    # スケール選択（ここで無次元化を安定させる）
+    Q_ref = q0_phys             # q~/Q~ ≈ O(1)
+    V_ref = V0_phys             # V~ ≈ O(1)
+    Y_ref = q0_phys**2 * 0.1    # 適当に大きめのスケール（必要に応じて調整）
+
+    # 物理パラメータ
+    sigma_phys = 0.45
+    alpha_phys = 0.01
+    gamma_phys = 3e-6
+    eps_phys = 1e-2            # q の正則化ノイズ
+    eta_phys = 0.15            # L(ρ)=ηρ^2 の η
+    k_F_phys = 5e-7            # F(z)=k_F*z の k_F
+    K_h_phys = 1e-5            # h(q) の K
+
+    # g'/g(t) （ここでは g≡1 として 0）
+    def gpg_phys(t):
+        return 0.0
+
+    # 問題インスタンス
+    problem = ZetaFBSDE_ND(
+        T_phys,
+        y0_phys, q0_phys, Q0_phys, V0_phys,
+        Q_ref, V_ref, Y_ref,
+        sigma_phys, alpha_phys, gamma_phys,
+        eps_phys, eta_phys,
+        k_F_phys, K_h_phys,
+        gpg_phys
+    )
+
+    trainer = DeepFBSDETrainer(problem, hidden_dim=128, n_layers=3)
+
+    print("\n=== Training ND DeepFBSDE ===")
+    trainer.train(batch=256, N_time=50, n_iter=8000, lr=1e-3, log_interval=1000)
+
+    z0_hat = trainer.evaluate_y0()
+    print("\nEstimated ζ(0,x0) ≈", z0_hat)
+
+    # ★最適 q(t) 軌道を計算
+    print("\n=== Computing approximate optimal q(t) trajectory ===")
+    times, q_traj = compute_optimal_q_trajectory(problem, trainer, N_time=100)
+
+    for i in range(0, len(times), 20):
+        print(f"t={times[i]:.3f}, q(t)≈{q_traj[i]:.3f}")
+
+    # （プロットしたければここで matplotlib を呼ぶ）
+    # import matplotlib.pyplot as plt
+    # plt.plot(times, q_traj)
+    # plt.xlabel("t")
+    # plt.ylabel("q(t)")
+    # plt.grid(True)
+    # plt.show()
