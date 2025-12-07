@@ -1,0 +1,245 @@
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_default_dtype(torch.float32)
+
+class FBSDEProblem:
+    def __init__(self, x0, T, dim_x=1, dim_y=1, dim_d=1):
+        self.dim_x, self.dim_y, self.dim_d, self.T = dim_x, dim_y, dim_d, T
+        x0 = np.array(x0, dtype=np.float32).reshape(1, dim_x)
+        self.x0 = torch.tensor(x0, device=device)
+
+    def b(self, t, x, y): return torch.zeros_like(x)
+    def sigma(self, t, x): return torch.zeros(x.shape[0], self.dim_x, self.dim_d, device=device)
+    def f(self, t, x, y, z): return torch.zeros(x.shape[0], self.dim_y, device=device)
+    def g(self, x): return torch.zeros(x.shape[0], self.dim_y, device=device)
+
+class DeepFBSDEModel(nn.Module):
+    def __init__(self, eq, hidden_dim=128, n_layers=3):
+        super().__init__()
+        self.eq = eq
+        layers = []
+        in_dim = eq.dim_x + 1
+        last = in_dim
+        for _ in range(n_layers):
+            layers.append(nn.Linear(last, hidden_dim))
+            layers.append(nn.ReLU())
+            last = hidden_dim
+        self.mlp = nn.Sequential(*layers)
+        self.out = nn.Linear(last, eq.dim_y * eq.dim_d)
+        self.y0 = nn.Parameter(torch.zeros(eq.dim_y, device=device))
+
+    def phi(self, xt):
+        z = self.out(self.mlp(xt))
+        return z.view(-1, self.eq.dim_y, self.eq.dim_d)
+
+    def forward(self, batch, N):
+        dt = self.eq.T / N
+        dW = torch.randn(batch, self.eq.dim_d, N, device=device) * math.sqrt(dt)
+        x = self.eq.x0.repeat(batch, 1)
+        y = self.y0.unsqueeze(0).repeat(batch, 1)
+        for n in range(N):
+            t = n * dt
+            t_tensor = torch.full((batch, 1), t, device=device)
+            xt = torch.cat([x, t_tensor], 1)
+            z = self.phi(xt)
+            dW_n = dW[:, :, n].unsqueeze(-1)
+            b_val = self.eq.b(t, x, y)
+            sigma_val = self.eq.sigma(t, x)
+            x = x + b_val * dt + torch.matmul(sigma_val, dW_n).view(batch, self.eq.dim_x)
+            y = y - self.eq.f(t, x, y, z) * dt + torch.matmul(z, dW_n).view(batch, self.eq.dim_y)
+        return x, y
+
+class DeepFBSDETrainer:
+    def __init__(self, eq, hidden_dim=128, n_layers=3):
+        self.eq = eq
+        self.model = DeepFBSDEModel(eq, hidden_dim, n_layers).to(device)
+
+    def train(self, batch=512, N_time=50, n_iter=8000, lr=1e-3, log_interval=1000):
+        opt = torch.optim.Adam(self.model.parameters(), lr=lr)
+        loss_fn = nn.MSELoss()
+        for it in range(1, n_iter + 1):
+            x_T, y_T = self.model(batch, N_time)
+            g_T = self.eq.g(x_T)
+            loss = loss_fn(g_T, y_T)
+            if not torch.isfinite(loss):
+                print("NaN detected, stop at iter", it)
+                break
+            if it == n_iter // 2:
+                for g in opt.param_groups: g["lr"] = lr * 0.1
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1e4)
+            opt.step()
+            if it % log_interval == 0:
+                print(f"[iter {it:6d}] loss={loss.item():.3e}")
+
+    @torch.no_grad()
+    def evaluate_y0(self):
+        return float(self.model.y0.detach().cpu().numpy()[0])
+
+class ZetaFBSDE_ND(FBSDEProblem):
+    def __init__(self, T_phys, y0, q0, Q0, V0,
+                 Q_ref, V_ref, Y_ref,
+                 sigma, alpha, gamma, eps, eta, kF, K_h,
+                 gpg):
+        y0_nd = y0 / Y_ref
+        q0_nd = q0 / Q_ref
+        Q0_nd = Q0 / Q_ref
+        V0_nd = V0 / V_ref
+        super().__init__([y0_nd, q0_nd, Q0_nd, V0_nd], 1.0, dim_x=4, dim_y=1, dim_d=3)
+        self.T_phys = T_phys
+        self.y0_phys = y0
+        self.q0_phys = q0
+        self.Q0_phys = Q0
+        self.V0_phys = V0
+        self.Q_ref = Q_ref
+        self.V_ref = V_ref
+        self.Y_ref = Y_ref
+        self.sigma_phys = sigma
+        self.alpha_phys = alpha
+        self.gamma_phys = gamma
+        self.eps_phys = eps
+        self.eta_phys = eta
+        self.kF = kF
+        self.K_h = K_h
+        self.gpg = gpg
+        T = T_phys
+        self.A1 = (V_ref * T * q0) / Y_ref
+        self.B1 = (q0 * sigma * Q_ref * math.sqrt(T)) / Y_ref
+        self.C1 = (V_ref * T) / Q_ref
+        self.eps_nd = eps / (Q_ref * math.sqrt(T))
+        self.alpha_nd = alpha * math.sqrt(T)
+        self.risk_coeff_nd = 0.5 * sigma * sigma * gamma * (Q_ref ** 2)
+        self.P_MAX = 1e4
+        self.F_MAX = 1e6
+        self.H_SCALE = (abs(kF) * q0 * q0 + abs(K_h) * q0 * q0 + 1.0)
+
+    def b(self, t, x, y):
+        Y_nd, q_nd, Q_nd, V_nd = x[:, 0], x[:, 1], x[:, 2], x[:, 3]
+        q = q_nd * self.Q_ref
+        V = V_nd * self.V_ref
+        Fv = self.kF * (self.q0_phys - q)
+        bY = self.A1 * V_nd * Fv
+        bq = torch.zeros_like(q_nd)
+        bQ = self.C1 * V_nd
+        t_phys = self.T_phys * t
+        bV = V_nd * self.gpg(t_phys)
+        return torch.stack([bY, bq, bQ, bV], 1)
+
+    def sigma(self, t, x):
+        q_nd, Q_nd, V_nd = x[:, 1], x[:, 2], x[:, 3]
+        batch = x.shape[0]
+        out = torch.zeros(batch, 4, 3, device=device)
+        out[:, 0, 0] = self.B1 * Q_nd
+        out[:, 1, 1] = self.eps_nd
+        out[:, 3, 2] = self.alpha_nd * V_nd
+        return out
+
+    def f(self, t, x, y, z):
+        z2 = z[:, 0, 1]
+        q_nd, V_nd = x[:, 1], x[:, 3]
+        q0_nd = self.q0_phys / self.Q_ref
+        term_risk = self.risk_coeff_nd * (q_nd - q0_nd) ** 2
+        p = z2 / (self.eps_nd * self.Q_ref + 1e-12)
+        p = torch.clamp(p, -self.P_MAX, self.P_MAX)
+        Hval = (p * p) / (4.0 * self.eta_phys)
+        V = V_nd * self.V_ref
+        term_H = -V * Hval
+        f_val = term_risk + term_H
+        f_val = torch.clamp(f_val, -self.F_MAX, self.F_MAX)
+        return f_val.view(-1, 1)
+
+    def g(self, x):
+        Y_nd, q_nd, Q_nd = x[:, 0], x[:, 1], x[:, 2]
+        Y = Y_nd * self.Y_ref
+        q = q_nd * self.Q_ref
+        Q = Q_nd * self.Q_ref
+        integral_F = 0.5 * self.kF * q * q
+        F_q0 = self.kF * (self.q0_phys - q)
+        h_raw = -integral_F + q * F_q0 + self.K_h * q * q
+        h_nd = h_raw / self.H_SCALE
+        val = -Y / Q + h_nd
+        return val.view(-1, 1)
+
+@torch.no_grad()
+def compute_optimal_q_trajectory(problem, trainer, N_time=100):
+    model = trainer.model
+    model.eval()
+    T = problem.T_phys
+    dt = T / N_time
+    y = problem.y0_phys
+    q = problem.q0_phys
+    Q = problem.Q0_phys
+    V = problem.V0_phys
+    times = [0.0]
+    qs = [q]
+    rho_lin = q / T
+    rho_max = 5.0 * abs(rho_lin)
+    q_min = -2.0 * abs(problem.q0_phys)
+    q_max = 2.0 * abs(problem.q0_phys)
+    for n in range(N_time):
+        t = n * dt
+        t_nd = t / T
+        x_nd = torch.tensor([[y / problem.Y_ref,
+                              q / problem.Q_ref,
+                              Q / problem.Q_ref,
+                              V / problem.V_ref]], device=device)
+        t_tensor = torch.tensor([[t_nd]], device=device)
+        xt = torch.cat([x_nd, t_tensor], 1)
+        z = model.phi(xt)
+        z2_nd = float(z[0, 0, 1].item())
+        p_phys = z2_nd / (problem.eps_nd * problem.Q_ref + 1e-12)
+        p_phys = max(min(p_phys, problem.P_MAX), -problem.P_MAX)
+        rho_star = p_phys / (2.0 * problem.eta_phys)
+        if not math.isfinite(rho_star):
+            rho_star = 0.0
+        rho_star = max(min(rho_star, rho_max), -rho_max)
+        q = q - rho_star * dt
+        q = max(min(q, q_max), q_min)
+        Q = Q + V * dt
+        V = V * (1.0 + problem.gpg(t) * dt)
+        Fv = problem.kF * (problem.q0_phys - q)
+        y = y + V * problem.q0_phys * Fv * dt
+        if not (math.isfinite(q) and math.isfinite(Q) and math.isfinite(V) and math.isfinite(y)):
+            print(f"[warning] non-finite at step {n}, break.")
+            break
+        times.append(t + dt)
+        qs.append(q)
+    return np.array(times), np.array(qs)
+
+if __name__ == "__main__":
+    print("device =", device)
+    if torch.cuda.is_available():
+        i = torch.cuda.current_device()
+        print("GPU index =", i, "name =", torch.cuda.get_device_name(i))
+    T_phys = 1.0
+    y0 = 0.0
+    q0 = 400000.0
+    Q0 = 400000.0
+    V0 = 4_000_000.0
+    Q_ref = q0
+    V_ref = V0
+    Y_ref = q0 * q0 * 0.1
+    sigma = 0.45
+    alpha = 0.01
+    gamma = 3e-6
+    eps = 1e-2
+    eta = 0.15
+    kF = 5e-7
+    K_h = 1e-5  # ここを好きに変えて試す
+    def gpg(t): return 0.0
+    problem = ZetaFBSDE_ND(T_phys, y0, q0, Q0, V0,
+                           Q_ref, V_ref, Y_ref,
+                           sigma, alpha, gamma, eps, eta, kF, K_h, gpg)
+    trainer = DeepFBSDETrainer(problem, hidden_dim=128, n_layers=3)
+    print("=== Training ===")
+    trainer.train(batch=256, N_time=50, n_iter=8000, lr=1e-3, log_interval=1000)
+    print("\nζ(0,x0) ≈", trainer.evaluate_y0())
+    print("\n=== optimal q(t) ===")
+    times, qtraj = compute_optimal_q_trajectory(problem, trainer, N_time=100)
+    for i in range(0, len(times), 20):
+        print(f"{times[i]:.3f}", qtraj[i])
