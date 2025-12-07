@@ -1,0 +1,278 @@
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ===== デバイス設定 =====
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_default_dtype(torch.float64)
+print("device =", device)
+
+if torch.cuda.is_available():
+    i = torch.cuda.current_device()
+    print("GPU index =", i)
+    print("GPU name  =", torch.cuda.get_device_name(i))
+    p = torch.cuda.get_device_properties(i)
+    print(f"memory [GB]      = {p.total_memory/1024**3:.2f}")
+    print("multiprocessors  =", p.multi_processor_count)
+    print("compute capability =", p.major, ".", p.minor, sep="")
+
+# ============================================================
+# 0. 正規CDFと Black–Scholes 解析解（scipy 不要）
+# ============================================================
+
+def norm_cdf(x: torch.Tensor) -> torch.Tensor:
+    """
+    標準正規分布のCDF Φ(x) を、torch だけで実装
+    """
+    return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
+
+def bs_call_price(S0: float, K: float, T: float, r: float, sigma: float) -> float:
+    """
+    Black–Scholes コール価格の解析解（scipy 不要版）
+    戻り値は Python float
+    """
+    S0_t = torch.tensor(S0, dtype=torch.float64)
+    K_t  = torch.tensor(K,  dtype=torch.float64)
+
+    d1 = (torch.log(S0_t / K_t) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+
+    price = S0_t * norm_cdf(d1) - K_t * math.exp(-r * T) * norm_cdf(d2)
+    return price.item()
+
+# ============================================================
+# 1. 一般用 FBSDE 問題クラス（テンプレート）
+# ============================================================
+
+class FBSDEProblem:
+    """
+    一般の FBSDE:
+      dX_t = b(t, X_t, Y_t) dt + sigma(t, X_t) dW_t
+      dY_t = -f(t, X_t, Y_t, Z_t) dt + Z_t dW_t,  Y_T = g(X_T)
+
+    dim_x: X_t の次元
+    dim_y: Y_t の次元（通常 1）
+    dim_d: Brown 過程の次元
+    """
+
+    def __init__(self, x0, T, dim_x=1, dim_y=1, dim_d=1):
+        self.dim_x = dim_x
+        self.dim_y = dim_y
+        self.dim_d = dim_d
+        self.T = T
+
+        x0 = np.array(x0, dtype=np.float64).reshape(1, dim_x)
+        self.x0 = torch.tensor(x0, dtype=torch.float64, device=device)
+
+    # ---- 以下4つは問題ごとにオーバーライドして使う ----
+    def b(self, t, x, y):
+        """
+        drift: dX_t の dt 項
+        x: [batch, dim_x], y: [batch, dim_y]
+        戻り値: [batch, dim_x]
+        """
+        return torch.zeros_like(x)
+
+    def sigma(self, t, x):
+        """
+        diffusion: dX_t の dW 項
+        戻り値: [batch, dim_x, dim_d]
+        """
+        batch_size = x.shape[0]
+        return torch.zeros(batch_size, self.dim_x, self.dim_d, device=device)
+
+    def f(self, t, x, y, z):
+        """
+        driver f(t,x,y,z): dY_t = -f dt + Z dW の f
+        戻り値: [batch, dim_y]
+        """
+        return torch.zeros(x.shape[0], self.dim_y, device=device)
+
+    def g(self, x):
+        """
+        終端条件 Y_T = g(X_T)
+        x: [batch, dim_x]
+        戻り値: [batch, dim_y]
+        """
+        return torch.zeros(x.shape[0], self.dim_y, device=device)
+
+# ============================================================
+# 2. Black–Scholes コールに対応する FBSDE 問題
+# ============================================================
+
+class BSCallFBSDE(FBSDEProblem):
+    """
+    Black–Scholes PDE:
+      ∂_t u + r s ∂_s u + 0.5 σ^2 s^2 ∂_ss u - r u = 0
+      u(T,s) = (s-K)^+
+    に対応する FBSDE:
+
+      dS_t = r S_t dt + σ S_t dW_t
+      dY_t = -f dt + Z_t dW_t,   Y_T = g(S_T)
+      f(t,s,y,z) = -r y
+      g(s) = (s-K)^+
+    """
+
+    def __init__(self, S0, K, r, sigma, T):
+        super().__init__(x0=[S0], T=T, dim_x=1, dim_y=1, dim_d=1)
+        self.K = K
+        self.r = r
+        self.sigma_val = sigma
+
+    def b(self, t, x, y):
+        # dS_t = r S_t dt + ...
+        return self.r * x
+
+    def sigma(self, t, x):
+        # sigma(t,x) = σ S_t, 形状は [batch, dim_x, dim_d]
+        batch_size = x.shape[0]
+        return (self.sigma_val * x).view(batch_size, 1, 1)
+
+    def f(self, t, x, y, z):
+        # PDE: ∂_t u + L u + F = 0, F = -r u
+        # BSDE: dY_t = -F dt + Z dW_t → f = F = -r y
+        return -self.r * y
+
+    def g(self, x):
+        # Y_T = (S_T - K)^+
+        payoff = torch.clamp(x[:, 0] - self.K, min=0.0)
+        return payoff.view(-1, 1)
+
+# ============================================================
+# 3. Z(t,x) を近似する NN + Y0 を持つモデル
+# ============================================================
+
+class DeepFBSDEModel(nn.Module):
+    def __init__(self, equation: FBSDEProblem, hidden_dim=64):
+        super().__init__()
+        self.eq = equation
+
+        in_dim = equation.dim_x + 1           # x と t を結合
+        out_dim = equation.dim_y * equation.dim_d  # Z の次元を flat にしたもの
+
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, out_dim)
+
+        # Y_0 = u(0,x0) も学習対象
+        self.y0 = nn.Parameter(
+            torch.zeros(equation.dim_y, dtype=torch.float64, device=device)
+        )
+
+    def phi(self, xt):
+        """
+        xt: [batch, dim_x + 1]  (状態 + 時刻)
+        戻り値: Z_t  [batch, dim_y, dim_d]
+        """
+        h = F.relu(self.fc1(xt))
+        h = F.relu(self.fc2(h))
+        z_flat = self.fc3(h)  # [batch, dim_y * dim_d]
+        z = z_flat.view(-1, self.eq.dim_y, self.eq.dim_d)
+        return z
+
+    def forward(self, batch_size, N_time):
+        T = self.eq.T
+        dim_d = self.eq.dim_d
+        dim_x = self.eq.dim_x
+        dim_y = self.eq.dim_y
+
+        dt = T / N_time
+        dW = torch.randn(batch_size, dim_d, N_time, device=device) * math.sqrt(dt)
+
+        x = self.eq.x0.repeat(batch_size, 1)
+        y = self.y0.unsqueeze(0).repeat(batch_size, 1)
+
+        for n in range(N_time):
+            t_n = n * dt
+            t_tensor = torch.full((batch_size, 1), t_n, dtype=torch.float64, device=device)
+            xt = torch.cat([x, t_tensor], dim=1)
+
+            z = self.phi(xt)                          # Z_n
+            dW_n = dW[:, :, n].unsqueeze(-1)
+
+            x_old = x
+
+            # Forward: X_{n+1} = X_n + b dt + sigma dW
+            b_val     = self.eq.b(t_n, x_old, y)
+            sigma_val = self.eq.sigma(t_n, x_old)
+            x_new     = x_old + b_val * dt + torch.matmul(sigma_val, dW_n).view(-1, dim_x)
+
+            # Backward: Y_{n+1} = Y_n - f dt + Z dW
+            f_val = self.eq.f(t_n, x_old, y, z)
+            y = y - f_val * dt + torch.matmul(z, dW_n).view(-1, dim_y)
+
+            x = x_new
+
+        return x, y
+
+# ============================================================
+# 4. 学習用 Trainer
+# ============================================================
+
+class DeepFBSDETrainer:
+    def __init__(self, equation: FBSDEProblem, hidden_dim=64):
+        self.eq = equation
+        self.model = DeepFBSDEModel(equation, hidden_dim=hidden_dim).to(device)
+
+    def train(self, batch_size=256, N_time=50, n_iter=5000, lr=1e-3, log_interval=500):
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        criterion = nn.MSELoss()
+
+        for it in range(1, n_iter + 1):
+            self.model.train()
+            x_T, y_T = self.model(batch_size, N_time)
+            g_T = self.eq.g(x_T)
+
+            loss = criterion(g_T, y_T)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if it % log_interval == 0:
+                print(f"[iter {it:6d}] loss={loss.item():.3e}")
+
+    @torch.no_grad()
+    def evaluate_y0(self):
+        """
+        学習された Y_0 ≒ u(0,x0) を numpy で返す
+        """
+        return self.model.y0.detach().cpu().numpy()
+
+# ============================================================
+# 5. 実際に Black–Scholes 問題でテスト
+# ============================================================
+
+# ---- パラメータ設定 ----
+S0 = 100.0
+K  = 100.0
+r  = 0.05
+sigma = 0.2
+T = 1.0
+
+print("\n=== Black–Scholes DeepFBSDE テスト開始 ===")
+print(f"S0={S0}, K={K}, T={T}, r={r}, sigma={sigma}")
+
+problem = BSCallFBSDE(S0, K, r, sigma, T)
+trainer = DeepFBSDETrainer(problem, hidden_dim=64)
+
+# ---- 学習 ----
+trainer.train(
+    batch_size=512,   # 256→512 でも 4090 なら余裕のはず
+    N_time=100,       # 50→100 に増やす（time discretization を細かく）
+    n_iter=20000,     # 5000→20000 に増やす
+    lr=1e-3,
+    log_interval=1000
+)
+
+# ---- Y0 と解析解の比較 ----
+y0_hat = float(trainer.evaluate_y0()[0])
+bs_exact = bs_call_price(S0, K, T, r, sigma)
+
+print("\n=== 結果比較 ===")
+print(f"DeepFBSDE 近似:  Y0 ≈ {y0_hat:.6f}")
+print(f"Black–Scholes:  BS = {bs_exact:.6f}")
+rel_err = abs(y0_hat - bs_exact) / bs_exact
+print(f"相対誤差 = {rel_err:.3e}")
